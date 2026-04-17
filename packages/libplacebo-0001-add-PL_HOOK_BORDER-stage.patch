@@ -1,0 +1,273 @@
+From a798aa82d0aa1e4ff89e5085debfd92492b62288 Mon Sep 17 00:00:00 2001
+From: MisterD0ctor <kasper.axelsson1@gmail.com>
+Date: Fri, 17 Apr 2026 19:06:36 +0200
+Subject: [PATCH] renderer: add PL_HOOK_BORDER stage for shader-driven
+ letterbox fill
+
+Adds a new hook stage that runs over the border/letterbox region of the
+target surface after the base clear and main image composition, but
+before any further processing. The hook sees the final composited video
+as its input texture (HOOKED) and its output is dispatched into the four
+conditional border quads via the same geometry used by clear_target().
+
+Works with mpv-style user shaders via //!HOOK BORDER. Unknown HOOK
+strings silently no-op on older libplacebo, so shaders using this stage
+degrade gracefully.
+
+Motivated by ambient-lighting shaders for ultrawide displays where the
+user wants to fill the black bars with a content-aware effect beyond
+what --border-background=blur provides.
+---
+ src/include/libplacebo/shaders/custom.h |  10 ++
+ src/renderer.c                          | 165 ++++++++++++++++++++++--
+ src/shaders/custom_mpv.c                |   3 +
+ 3 files changed, 165 insertions(+), 13 deletions(-)
+
+diff --git a/src/include/libplacebo/shaders/custom.h b/src/include/libplacebo/shaders/custom.h
+index a4eec69..c9dfe6d 100644
+--- a/src/include/libplacebo/shaders/custom.h
++++ b/src/include/libplacebo/shaders/custom.h
+@@ -126,6 +126,15 @@ enum pl_hook_stage {
+     PL_HOOK_SCALED          = 1 << 13, // After scaling, before color management
+     PL_HOOK_PRE_OUTPUT      = 1 << 14, // After color management, before blending/rotation
+     PL_HOOK_OUTPUT          = 1 << 15, // After blending/rotation, before dithering
++
++    // Hook stage that runs over the border/letterbox region of the target,
++    // after the base clear (color/tiles/blur) has been applied and the video
++    // has been composited into its rect, but before dithering. Not resizable.
++    //
++    // The hook shader is invoked only for fragments outside the video rect.
++    // `MAIN` (if bound) refers to the final composited video in the target
++    // color space. `HOOKED` is undefined for this stage — use explicit binds.
++    PL_HOOK_BORDER          = 1 << 16,
+ };
+ 
+ // Returns true if a given hook stage is resizable
+@@ -149,6 +158,7 @@ static inline bool pl_hook_stage_resizable(enum pl_hook_stage stage) {
+     case PL_HOOK_SCALED:
+     case PL_HOOK_PRE_OUTPUT:
+     case PL_HOOK_OUTPUT:
++    case PL_HOOK_BORDER:
+         return false;
+     }
+ 
+diff --git a/src/renderer.c b/src/renderer.c
+index 576528b..401ce9c 100644
+--- a/src/renderer.c
++++ b/src/renderer.c
+@@ -2611,6 +2611,133 @@ static void clear_target(pl_renderer rr, const struct pl_frame *target,
+     }
+ }
+ 
++static bool has_border_hook(const struct pl_render_params *params)
++{
++    for (int i = 0; i < params->num_hooks; i++) {
++        if (params->hooks[i]->stages & PL_HOOK_BORDER)
++            return true;
++    }
++    return false;
++}
++
++// Run PL_HOOK_BORDER hooks and dispatch the result into the border region of
++// the target planes. `main_composited` is the final video at target resolution
++// (caller must ensure it's realized via img_tex() before pass_output_target
++// consumed pass->img). The hook(s) see main_composited as HOOKED.
++static void border_hook_pass(struct pass_state *pass, pl_tex main_composited)
++{
++    pl_renderer rr = pass->rr;
++    const struct pl_render_params *params = pass->params;
++    const struct pl_frame *target = &pass->target;
++
++    if (!main_composited) {
++        PL_ERR(rr, "PL_HOOK_BORDER requires FBOs, which are unavailable.");
++        return;
++    }
++
++    // Compose a transient img pointing at main_composited; pass_hook will
++    // iterate through all PL_HOOK_BORDER hooks and update it in place.
++    struct img border_img = {
++        .tex    = main_composited,
++        .w      = main_composited->params.w,
++        .h      = main_composited->params.h,
++        .comps  = 4,
++        .repr   = target->repr,
++        .color  = target->color,
++        .rect   = { 0, 0, main_composited->params.w, main_composited->params.h },
++        .unique = true,
++    };
++
++    if (!pass_hook(pass, &border_img, PL_HOOK_BORDER))
++        return;
++
++    pl_tex hooked_tex = img_tex(pass, &border_img);
++    if (!hooked_tex) {
++        PL_ERR(rr, "Failed to resolve border hook output to texture");
++        return;
++    }
++
++    const struct pl_plane *ref = &target->planes[frame_ref(target)];
++    const float w = ref->texture->params.w, h = ref->texture->params.h;
++    const float x0 = target->crop.x0 / w, x1 = target->crop.x1 / w;
++    const float y0 = target->crop.y0 / h, y1 = target->crop.y1 / h;
++
++    struct { float pos[2]; float coord[2]; } vertices[12] = {
++        { .coord = {  0,  0 } }, { .coord = { x0,  0 } },
++        { .coord = { x1,  0 } }, { .coord = {  1,  0 } },
++        { .coord = {  0,  1 } }, { .coord = { x0,  1 } },
++        { .coord = { x1,  1 } }, { .coord = {  1,  1 } },
++        { .coord = { x0, y0 } }, { .coord = { x1, y0 } },
++        { .coord = { x0, y1 } }, { .coord = { x1, y1 } },
++    };
++    for (int i = 0; i < PL_ARRAY_SIZE(vertices); i++) {
++        vertices[i].pos[0] = 2.0f * vertices[i].coord[0] - 1.0f;
++        vertices[i].pos[1] = 2.0f * vertices[i].coord[1] - 1.0f;
++    }
++
++    uint16_t indices[4 * 6];
++    int nb_indices = 0;
++    #define ADD_QUAD(A, B, C, D)   \
++    do {                           \
++        indices[nb_indices++] = A; \
++        indices[nb_indices++] = B; \
++        indices[nb_indices++] = C; \
++        indices[nb_indices++] = C; \
++        indices[nb_indices++] = B; \
++        indices[nb_indices++] = D; \
++    } while (0)
++
++    if (x0 > 0) ADD_QUAD(0, 1, 4, 5);
++    if (x1 < 1) ADD_QUAD(2, 3, 6, 7);
++    if (y0 > 0) ADD_QUAD(1, 2, 8, 9);
++    if (y1 < 1) ADD_QUAD(10, 11, 5, 6);
++    #undef ADD_QUAD
++
++    if (!nb_indices)
++        return;
++
++    for (int p = 0; p < target->num_planes; p++) {
++        const struct pl_plane *plane = &target->planes[p];
++
++        pl_shader sh = pl_dispatch_begin(rr->dp);
++        sh_describe(sh, "border hook output");
++        sh->output = PL_SHADER_SIG_COLOR;
++
++        ident_t tex = sh_desc(sh, (struct pl_shader_desc) {
++            .desc = {
++                .name = "hooked_tex",
++                .type = PL_DESC_SAMPLED_TEX,
++            },
++            .binding = {
++                .object = hooked_tex,
++                .address_mode = PL_TEX_ADDRESS_CLAMP,
++                .sample_mode = PL_TEX_SAMPLE_LINEAR,
++            },
++        });
++
++        GLSL("vec4 color = textureLod("$", coord, 0.0); \n", tex);
++
++        swizzle_color(sh, plane->components, plane->component_mapping,
++                      params->blend_params);
++
++        pl_dispatch_vertex(rr->dp, pl_dispatch_vertex_params(
++            .shader             = &sh,
++            .target             = plane->texture,
++            .blend_params       = params->blend_params,
++            .vertex_attribs     = rr->osd_attribs,
++            .num_vertex_attribs = 2,
++            .vertex_flipped     = plane->flipped,
++            .vertex_stride      = sizeof(vertices[0]),
++            .vertex_coords      = PL_COORDS_NORMALIZED,
++            .vertex_type        = PL_PRIM_TRIANGLE_LIST,
++            .vertex_count       = nb_indices,
++            .vertex_data        = vertices,
++            .index_data         = indices,
++            .index_fmt          = PL_INDEX_UINT16,
++        ));
++    }
++}
++
+ static void translate_srgb_color(float out_color[3], const float in_color[3],
+                                  const struct pl_color_space *csp)
+ {
+@@ -2836,25 +2963,34 @@ static bool pass_output_target(struct pass_state *pass)
+     bool flipped_x = dst_rect.x1 < dst_rect.x0,
+          flipped_y = dst_rect.y1 < dst_rect.y0;
+ 
++    bool need_border_hook = has_border_hook(params) && pl_frame_is_cropped(target);
++    pl_tex main_composited = NULL;
++
+     if (pl_frame_is_cropped(target)) {
+         pl_tex border_tex = NULL;
+-        if (params->border == PL_CLEAR_BLUR && !(rr->errors & PL_RENDER_ERR_BLUR)) {
++        bool need_blur = params->border == PL_CLEAR_BLUR && !(rr->errors & PL_RENDER_ERR_BLUR);
++        if (need_blur || need_border_hook) {
+             pl_tex tex = img_tex(pass, img);
+             if (!tex) {
+-                PL_ERR(rr, "Output requires blurred borders, but FBOs are "
+-                    "unavailable. This combination is unsupported.");
++                PL_ERR(rr, "Output requires %s, but FBOs are "
++                    "unavailable. This combination is unsupported.",
++                    need_border_hook ? "border hooks" : "blurred borders");
+                 return false;
+             }
+-
+-            const int ref_w = ref->texture->params.w, ref_h = ref->texture->params.h;
+-            pl_rect2df rect = img->rect;
+-            pl_rect2df_aspect_set(&rect, (float) ref_w / ref_h, 0.0);
+-            pl_rect2df_rotate(&rect, pass->rotation);
+-
+-            border_tex = pass_blur(pass, tex, img->comps, &rect, params->blur_radius);
+-            if (!border_tex) {
+-                PL_ERR(rr, "Failed to generate blurred borders.");
+-                return false;
++            if (need_border_hook)
++                main_composited = tex;
++
++            if (need_blur) {
++                const int ref_w = ref->texture->params.w, ref_h = ref->texture->params.h;
++                pl_rect2df rect = img->rect;
++                pl_rect2df_aspect_set(&rect, (float) ref_w / ref_h, 0.0);
++                pl_rect2df_rotate(&rect, pass->rotation);
++
++                border_tex = pass_blur(pass, tex, img->comps, &rect, params->blur_radius);
++                if (!border_tex) {
++                    PL_ERR(rr, "Failed to generate blurred borders.");
++                    return false;
++                }
+             }
+         }
+ 
+@@ -3019,6 +3155,9 @@ static bool pass_output_target(struct pass_state *pass)
+                       &tscale);
+     }
+ 
++    if (need_border_hook)
++        border_hook_pass(pass, main_composited);
++
+     *img = (struct img) {0};
+     return true;
+ }
+diff --git a/src/shaders/custom_mpv.c b/src/shaders/custom_mpv.c
+index 4ef0817..d8d84c4 100644
+--- a/src/shaders/custom_mpv.c
++++ b/src/shaders/custom_mpv.c
+@@ -869,6 +869,8 @@ static enum pl_hook_stage mp_stage_to_pl(pl_str stage)
+         return PL_HOOK_PRE_OUTPUT;
+     if (pl_str_equals0(stage, "OUTPUT"))
+         return PL_HOOK_OUTPUT;
++    if (pl_str_equals0(stage, "BORDER"))
++        return PL_HOOK_BORDER;
+ 
+     return 0;
+ }
+@@ -896,6 +898,7 @@ static pl_str pl_stage_to_mp(enum pl_hook_stage stage)
+     case PL_HOOK_SCALED:        return pl_str0("SCALED");
+     case PL_HOOK_PRE_OUTPUT:    return pl_str0("PREOUTPUT");
+     case PL_HOOK_OUTPUT:        return pl_str0("OUTPUT");
++    case PL_HOOK_BORDER:        return pl_str0("BORDER");
+     };
+ 
+     pl_unreachable();
+-- 
+2.37.3.windows.1
+
