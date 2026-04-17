@@ -4,6 +4,7 @@ ExternalProject_Add(libsixel
     GIT_CLONE_FLAGS "--sparse --filter=tree:0"
     GIT_CLONE_POST_COMMAND "sparse-checkout set --no-cone /* !images"
     UPDATE_COMMAND ""
+    PATCH_COMMAND ${EXEC} git am --3way --ignore-whitespace ${CMAKE_CURRENT_SOURCE_DIR}/libsixel-*.patch
     CONFIGURE_COMMAND ${EXEC} <SOURCE_DIR>/autogen.sh && CONF=1 <SOURCE_DIR>/configure
         --host=${TARGET_ARCH}
         --prefix=${MINGW_INSTALL_PREFIX}

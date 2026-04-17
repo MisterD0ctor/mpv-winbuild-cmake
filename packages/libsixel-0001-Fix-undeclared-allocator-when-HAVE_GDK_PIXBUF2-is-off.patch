@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mpv-winbuild-cmake <noreply@localhost>
+Date: Thu, 17 Apr 2026 00:00:00 +0000
+Subject: [PATCH] loader: guard allocator cleanup with HAVE_GDK_PIXBUF2
+
+The `allocator` variable in test2() is declared inside the
+`#if HAVE_GDK_PIXBUF2` block, but the cleanup path at the `end:`
+label references it unconditionally. When HAVE_GDK_PIXBUF2 is not
+defined the compiler errors with "'allocator' undeclared".
+---
+ src/loader.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/src/loader.c b/src/loader.c
+--- a/src/loader.c
++++ b/src/loader.c
+@@ -1596,9 +1596,11 @@ end:
+     if (test2_saved_frame != NULL) {
+         sixel_frame_unref(test2_saved_frame);
+         test2_saved_frame = NULL;
+     }
++#if HAVE_GDK_PIXBUF2
+     if (allocator != NULL) {
+         sixel_allocator_unref(allocator);
+     }
++#endif
+     return nret;
+ }
+--
+2.47.0
