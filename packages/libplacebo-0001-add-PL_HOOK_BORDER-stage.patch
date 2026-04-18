@@ -1,4 +1,4 @@
-From 52d834ed42305ee72a5be1d14cb3067e96b40345 Mon Sep 17 00:00:00 2001
+From 35067e30788d58d950e8be22a155576b051408e0 Mon Sep 17 00:00:00 2001
 From: MisterD0ctor <kasper.axelsson1@gmail.com>
 Date: Fri, 17 Apr 2026 19:06:36 +0200
 Subject: [PATCH] renderer: add PL_HOOK_BORDER stage for shader-driven
@@ -18,10 +18,10 @@ Motivated by ambient-lighting shaders for ultrawide displays where the
 user wants to fill the black bars with a content-aware effect beyond
 what --border-background=blur provides.
 ---
- src/include/libplacebo/shaders/custom.h |  15 +++
- src/renderer.c                          | 165 ++++++++++++++++++++++--
- src/shaders/custom_mpv.c                |  26 ++++
- 3 files changed, 193 insertions(+), 13 deletions(-)
+ src/include/libplacebo/shaders/custom.h |  15 ++
+ src/renderer.c                          | 235 ++++++++++++++++++++++--
+ src/shaders/custom_mpv.c                |  26 +++
+ 3 files changed, 263 insertions(+), 13 deletions(-)
 
 diff --git a/src/include/libplacebo/shaders/custom.h b/src/include/libplacebo/shaders/custom.h
 index a4eec69..5b578bf 100644
@@ -57,10 +57,10 @@ index a4eec69..5b578bf 100644
      }
  
 diff --git a/src/renderer.c b/src/renderer.c
-index 576528b..401ce9c 100644
+index 576528b..06dd999 100644
 --- a/src/renderer.c
 +++ b/src/renderer.c
-@@ -2611,6 +2611,133 @@ static void clear_target(pl_renderer rr, const struct pl_frame *target,
+@@ -2611,6 +2611,203 @@ static void clear_target(pl_renderer rr, const struct pl_frame *target,
      }
  }
  
@@ -88,16 +88,91 @@ index 576528b..401ce9c 100644
 +        return;
 +    }
 +
-+    // Compose a transient img pointing at main_composited; pass_hook will
-+    // iterate through all PL_HOOK_BORDER hooks and update it in place.
++    // Dimensions of the video rect and the full target (reference plane).
++    const struct pl_plane *ref = &target->planes[frame_ref(target)];
++    const int target_w = ref->texture->params.w;
++    const int target_h = ref->texture->params.h;
++    const float w = target_w, h = target_h;
++    const float x0 = target->crop.x0 / w, x1 = target->crop.x1 / w;
++    const float y0 = target->crop.y0 / h, y1 = target->crop.y1 / h;
++
++    // Allocate a target-sized FBO and composite `main_composited` into its
++    // video rect. This gives the hook a HOOKED texture where normalized
++    // coordinates map directly to target-space, so BORDER_rect = (x0,y0,x1,y1)
++    // is meaningful and consistent across hook inputs and outputs.
++    pl_tex target_fbo = get_fbo(pass, target_w, target_h, NULL, 4, PL_DEBUG_TAG);
++    if (!target_fbo) {
++        PL_ERR(rr, "PL_HOOK_BORDER requires FBOs, which are unavailable.");
++        return;
++    }
++
++    // Render a fullscreen pass into target_fbo that writes main_composited
++    // in the video rect and zero elsewhere. This gives the hook a
++    // target-sized HOOKED texture with a defined value for every fragment.
++    {
++        pl_shader sh = pl_dispatch_begin(rr->dp);
++        sh_describe(sh, "border hook stage");
++        sh->output = PL_SHADER_SIG_COLOR;
++
++        ident_t src = sh_desc(sh, (struct pl_shader_desc) {
++            .desc = {
++                .name = "main_tex",
++                .type = PL_DESC_SAMPLED_TEX,
++            },
++            .binding = {
++                .object = main_composited,
++                .address_mode = PL_TEX_ADDRESS_CLAMP,
++                .sample_mode = PL_TEX_SAMPLE_LINEAR,
++            },
++        });
++
++        float rect[4] = { x0, y0, x1, y1 };
++        ident_t u_rect = sh_var(sh, (struct pl_shader_var) {
++            .var  = pl_var_vec4("video_rect"),
++            .data = rect,
++        });
++
++        // `coord` here is in target-normalized coords (the full target FBO).
++        // Remap it into main_composited's [0,1] space via video_rect.
++        GLSL("vec2 vp = (coord - "$".xy) / ("$".zw - "$".xy); \n",
++             u_rect, u_rect, u_rect);
++        GLSL("vec4 color = vec4(0.0); \n");
++        GLSL("if (all(greaterThanEqual(vp, vec2(0.0))) && all(lessThanEqual(vp, vec2(1.0)))) \n");
++        GLSL("    color = textureLod("$", vp, 0.0); \n", src);
++
++        struct { float pos[2]; float coord[2]; } vq[4] = {
++            { .pos = { -1, -1 }, .coord = { 0, 0 } },
++            { .pos = {  1, -1 }, .coord = { 1, 0 } },
++            { .pos = { -1,  1 }, .coord = { 0, 1 } },
++            { .pos = {  1,  1 }, .coord = { 1, 1 } },
++        };
++        uint16_t idx[6] = { 0, 1, 2, 2, 1, 3 };
++
++        pl_dispatch_vertex(rr->dp, pl_dispatch_vertex_params(
++            .shader             = &sh,
++            .target             = target_fbo,
++            .vertex_attribs     = rr->osd_attribs,
++            .num_vertex_attribs = 2,
++            .vertex_stride      = sizeof(vq[0]),
++            .vertex_coords      = PL_COORDS_NORMALIZED,
++            .vertex_type        = PL_PRIM_TRIANGLE_LIST,
++            .vertex_count       = 6,
++            .vertex_data        = vq,
++            .index_data         = idx,
++            .index_fmt          = PL_INDEX_UINT16,
++        ));
++    }
++
++    // Compose a transient img pointing at the target-sized FBO; pass_hook
++    // will iterate through all PL_HOOK_BORDER hooks and update it in place.
 +    struct img border_img = {
-+        .tex    = main_composited,
-+        .w      = main_composited->params.w,
-+        .h      = main_composited->params.h,
++        .tex    = target_fbo,
++        .w      = target_w,
++        .h      = target_h,
 +        .comps  = 4,
 +        .repr   = target->repr,
 +        .color  = target->color,
-+        .rect   = { 0, 0, main_composited->params.w, main_composited->params.h },
++        .rect   = { 0, 0, target_w, target_h },
 +        .unique = true,
 +    };
 +
@@ -109,11 +184,6 @@ index 576528b..401ce9c 100644
 +        PL_ERR(rr, "Failed to resolve border hook output to texture");
 +        return;
 +    }
-+
-+    const struct pl_plane *ref = &target->planes[frame_ref(target)];
-+    const float w = ref->texture->params.w, h = ref->texture->params.h;
-+    const float x0 = target->crop.x0 / w, x1 = target->crop.x1 / w;
-+    const float y0 = target->crop.y0 / h, y1 = target->crop.y1 / h;
 +
 +    struct { float pos[2]; float coord[2]; } vertices[12] = {
 +        { .coord = {  0,  0 } }, { .coord = { x0,  0 } },
@@ -194,7 +264,7 @@ index 576528b..401ce9c 100644
  static void translate_srgb_color(float out_color[3], const float in_color[3],
                                   const struct pl_color_space *csp)
  {
-@@ -2836,25 +2963,34 @@ static bool pass_output_target(struct pass_state *pass)
+@@ -2836,25 +3033,34 @@ static bool pass_output_target(struct pass_state *pass)
      bool flipped_x = dst_rect.x1 < dst_rect.x0,
           flipped_y = dst_rect.y1 < dst_rect.y0;
  
@@ -242,7 +312,7 @@ index 576528b..401ce9c 100644
              }
          }
  
-@@ -3019,6 +3155,9 @@ static bool pass_output_target(struct pass_state *pass)
+@@ -3019,6 +3225,9 @@ static bool pass_output_target(struct pass_state *pass)
                        &tscale);
      }
  
