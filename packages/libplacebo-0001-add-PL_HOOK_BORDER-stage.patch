@@ -1,4 +1,4 @@
-From a798aa82d0aa1e4ff89e5085debfd92492b62288 Mon Sep 17 00:00:00 2001
+From 52d834ed42305ee72a5be1d14cb3067e96b40345 Mon Sep 17 00:00:00 2001
 From: MisterD0ctor <kasper.axelsson1@gmail.com>
 Date: Fri, 17 Apr 2026 19:06:36 +0200
 Subject: [PATCH] renderer: add PL_HOOK_BORDER stage for shader-driven
@@ -18,16 +18,16 @@ Motivated by ambient-lighting shaders for ultrawide displays where the
 user wants to fill the black bars with a content-aware effect beyond
 what --border-background=blur provides.
 ---
- src/include/libplacebo/shaders/custom.h |  10 ++
+ src/include/libplacebo/shaders/custom.h |  15 +++
  src/renderer.c                          | 165 ++++++++++++++++++++++--
- src/shaders/custom_mpv.c                |   3 +
- 3 files changed, 165 insertions(+), 13 deletions(-)
+ src/shaders/custom_mpv.c                |  26 ++++
+ 3 files changed, 193 insertions(+), 13 deletions(-)
 
 diff --git a/src/include/libplacebo/shaders/custom.h b/src/include/libplacebo/shaders/custom.h
-index a4eec69..c9dfe6d 100644
+index a4eec69..5b578bf 100644
 --- a/src/include/libplacebo/shaders/custom.h
 +++ b/src/include/libplacebo/shaders/custom.h
-@@ -126,6 +126,15 @@ enum pl_hook_stage {
+@@ -126,6 +126,20 @@ enum pl_hook_stage {
      PL_HOOK_SCALED          = 1 << 13, // After scaling, before color management
      PL_HOOK_PRE_OUTPUT      = 1 << 14, // After color management, before blending/rotation
      PL_HOOK_OUTPUT          = 1 << 15, // After blending/rotation, before dithering
@@ -37,13 +37,18 @@ index a4eec69..c9dfe6d 100644
 +    // has been composited into its rect, but before dithering. Not resizable.
 +    //
 +    // The hook shader is invoked only for fragments outside the video rect.
-+    // `MAIN` (if bound) refers to the final composited video in the target
-+    // color space. `HOOKED` is undefined for this stage — use explicit binds.
++    // `HOOKED` refers to the final composited video in target color space,
++    // sampled over the whole target texture (the video region contains the
++    // rendered video; the rest contains the base clear result). A `vec4`
++    // `BORDER_rect` is additionally provided, giving the video rect in
++    // normalized [0,1] coordinates of the hook output, so shaders can
++    // identify which side of the border they are sampling independently
++    // of axis-dominance heuristics.
 +    PL_HOOK_BORDER          = 1 << 16,
  };
  
  // Returns true if a given hook stage is resizable
-@@ -149,6 +158,7 @@ static inline bool pl_hook_stage_resizable(enum pl_hook_stage stage) {
+@@ -149,6 +163,7 @@ static inline bool pl_hook_stage_resizable(enum pl_hook_stage stage) {
      case PL_HOOK_SCALED:
      case PL_HOOK_PRE_OUTPUT:
      case PL_HOOK_OUTPUT:
@@ -248,7 +253,7 @@ index 576528b..401ce9c 100644
      return true;
  }
 diff --git a/src/shaders/custom_mpv.c b/src/shaders/custom_mpv.c
-index 4ef0817..d8d84c4 100644
+index 4ef0817..3d50cde 100644
 --- a/src/shaders/custom_mpv.c
 +++ b/src/shaders/custom_mpv.c
 @@ -869,6 +869,8 @@ static enum pl_hook_stage mp_stage_to_pl(pl_str stage)
@@ -268,6 +273,36 @@ index 4ef0817..d8d84c4 100644
      };
  
      pl_unreachable();
+@@ -1392,6 +1395,29 @@ static struct pl_hook_res hook_hook(void *priv, const struct pl_hook_params *par
+             .data = tex_off,
+         }));
+ 
++        // For PL_HOOK_BORDER, expose the video rect in normalized [0,1]
++        // coordinates of the hook output texture (which spans the full
++        // composited target). Shaders can use this to identify border
++        // regions without relying on axis-dominance heuristics.
++        if (params->stage == PL_HOOK_BORDER && ctx.hooked.tex) {
++            float tw = ctx.hooked.tex->params.w;
++            float th = ctx.hooked.tex->params.h;
++            float dx0 = PL_MIN(params->dst_rect.x0, params->dst_rect.x1);
++            float dx1 = PL_MAX(params->dst_rect.x0, params->dst_rect.x1);
++            float dy0 = PL_MIN(params->dst_rect.y0, params->dst_rect.y1);
++            float dy1 = PL_MAX(params->dst_rect.y0, params->dst_rect.y1);
++            float border_rect[4] = {
++                tw > 0 ? dx0 / tw : 0.0f,
++                th > 0 ? dy0 / th : 0.0f,
++                tw > 0 ? dx1 / tw : 1.0f,
++                th > 0 ? dy1 / th : 1.0f,
++            };
++            GLSLH("#define BORDER_rect "$" \n", sh_var(sh, (struct pl_shader_var) {
++                .var = pl_var_vec4("BORDER_rect"),
++                .data = border_rect,
++            }));
++        }
++
+         // Custom parameters
+         for (int i = 0; i < p->hook_params.num; i++) {
+             const struct pl_hook_par *hp = &p->hook_params.elem[i];
 -- 
 2.37.3.windows.1
 
